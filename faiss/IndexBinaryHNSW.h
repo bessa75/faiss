@@ -11,6 +11,7 @@
 
 #include <faiss/IndexBinaryFlat.h>
 #include <faiss/impl/HNSW.h>
+#include <faiss/impl/hnsw/LockVector.h>
 #include <faiss/utils/utils.h>
 
 namespace faiss {
@@ -19,14 +20,14 @@ namespace faiss {
  * link structure built on top */
 
 struct IndexBinaryHNSW : IndexBinary {
-    typedef HNSW::storage_idx_t storage_idx_t;
+    using storage_idx_t = HNSW::storage_idx_t;
 
     // the link structure
     HNSW hnsw;
 
     // the sequential storage
-    bool own_fields;
-    IndexBinary* storage;
+    bool own_fields = false;
+    IndexBinary* storage = nullptr;
 
     // When set to false, level 0 in the knn graph is not initialized.
     // This option is used by GpuIndexBinaryCagra::copyTo(IndexBinaryHNSW*)
@@ -39,6 +40,11 @@ struct IndexBinaryHNSW : IndexBinary {
     // IndexBinaryHNSW to create a full base layer graph that is
     // used when GpuIndexBinaryCagra::copyFrom(IndexBinaryHNSW*) is called.
     bool keep_max_size_level0 = false;
+
+    // Per-node locks for HNSW graph construction.
+    LockVector locks;
+    // locks are freed after each call to add() unless this flag is set.
+    bool retain_locks = false;
 
     explicit IndexBinaryHNSW();
     explicit IndexBinaryHNSW(int d, int M = 32);

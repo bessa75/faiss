@@ -9,13 +9,16 @@
 
 #pragma once
 
+#include <optional>
 #include <vector>
-#include "faiss/Index.h"
 
+#include <faiss/Index.h>
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexPQ.h>
 #include <faiss/IndexScalarQuantizer.h>
 #include <faiss/impl/HNSW.h>
+#include <faiss/impl/Panorama.h>
+#include <faiss/impl/hnsw/LockVector.h>
 #include <faiss/utils/utils.h>
 
 namespace faiss {
@@ -26,7 +29,7 @@ struct IndexHNSW;
  * link structure built on top */
 
 struct IndexHNSW : Index {
-    typedef HNSW::storage_idx_t storage_idx_t;
+    using storage_idx_t = HNSW::storage_idx_t;
 
     // the link structure
     HNSW hnsw;
@@ -47,11 +50,20 @@ struct IndexHNSW : Index {
     // used when GpuIndexCagra::copyFrom(IndexHNSWCagra*) is invoked.
     bool keep_max_size_level0 = false;
 
+    // See impl/VisitedTable.h.
+    std::optional<bool> use_visited_hashset;
+
+    // Per-node locks for HNSW graph construction.
+    LockVector locks;
+    // locks are freed after each call to add() unless this flag is set.
+    bool retain_locks = false;
+
     explicit IndexHNSW(int d = 0, int M = 32, MetricType metric = METRIC_L2);
     explicit IndexHNSW(Index* storage, int M = 32);
 
     ~IndexHNSW() override;
 
+    /// Adds vectors to the index. May not be called concurrently.
     void add(idx_t n, const float* x) override;
 
     /// Trains the storage if needed
@@ -72,6 +84,12 @@ struct IndexHNSW : Index {
             float radius,
             RangeSearchResult* result,
             const SearchParameters* params = nullptr) const override;
+
+    /** search one vector with a custom result handler */
+    void search1(
+            const float* x,
+            ResultHandler& handler,
+            SearchParameters* params = nullptr) const override;
 
     void reconstruct(idx_t key, float* recons) const override;
 
@@ -111,7 +129,7 @@ struct IndexHNSW : Index {
 
     void link_singletons();
 
-    void permute_entries(const idx_t* perm);
+    virtual void permute_entries(const idx_t* perm);
 
     DistanceComputer* get_distance_computer() const override;
 };
@@ -123,6 +141,53 @@ struct IndexHNSW : Index {
 struct IndexHNSWFlat : IndexHNSW {
     IndexHNSWFlat();
     IndexHNSWFlat(int d, int M, MetricType metric = METRIC_L2);
+};
+
+/** Panorama implementation of IndexHNSWFlat following
+ * https://www.arxiv.org/pdf/2510.00566.
+ *
+ * Unlike cluster-based Panorama, the vectors have to be higher dimensional
+ * (i.e. typically d > 512) and/or be able to compress a lot of their energy in
+ * the early dimensions to be effective. This is because HNSW accesses vectors
+ * in a random order, which makes cache misses dominate the distance computation
+ * time.
+ *
+ * The `num_panorama_levels` parameter controls the granularity of progressive
+ * distance refinement, allowing candidates to be eliminated early using partial
+ * distance computations rather than computing full distances.
+ *
+ * NOTE: This version of HNSW handles search slightly differently than the
+ * vanilla HNSW, as it uses partial distance computations with progressive
+ * refinement bounds. Instead of computing full distances immediately for all
+ * candidates, Panorama maintains lower and upper bounds that are incrementally
+ * tightened across refinement levels. Candidates are inserted into the search
+ * beam using approximate distance estimates (LB+UB)/2 and are only fully
+ * evaluated when they survive pruning and enter the result heap. This allows
+ * the algorithm to prune unpromising candidates early using Cauchy-Schwarz
+ * bounds on partial inner products. Hence, recall is not guaranteed to be the
+ * same as vanilla HNSW due to the heterogeneous precision within the search
+ * beam (exact vs. partial distance estimates affecting traversal order).
+ */
+struct IndexHNSWFlatPanorama : IndexHNSWFlat {
+    IndexHNSWFlatPanorama();
+    IndexHNSWFlatPanorama(
+            int d,
+            int M,
+            int num_panorama_levels,
+            MetricType metric = METRIC_L2);
+
+    void add(idx_t n, const float* x) override;
+    void reset() override;
+    void permute_entries(const idx_t* perm) override;
+
+    /// Inline for performance - called frequently in search hot path.
+    const float* get_cum_sum(idx_t i) const {
+        return cum_sums.data() + i * (pano.n_levels + 1);
+    }
+
+    std::vector<float> cum_sums;
+    Panorama pano;
+    const size_t num_panorama_levels;
 };
 
 /** PQ index topped with with a HNSW structure to access elements
@@ -201,9 +266,16 @@ struct IndexHNSWCagra : IndexHNSW {
             idx_t* labels,
             const SearchParameters* params = nullptr) const override;
 
+    void range_search(
+            idx_t n,
+            const float* x,
+            float radius,
+            RangeSearchResult* result,
+            const SearchParameters* params = nullptr) const override;
+
     faiss::NumericType get_numeric_type() const;
     void set_numeric_type(faiss::NumericType numeric_type);
-    NumericType numeric_type_;
+    NumericType numeric_type_ = Float32;
 };
 
 } // namespace faiss

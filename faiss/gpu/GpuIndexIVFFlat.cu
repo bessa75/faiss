@@ -210,14 +210,6 @@ void GpuIndexIVFFlat::train(idx_t n, const float* x) {
 
     if (this->is_trained) {
         FAISS_ASSERT(index_);
-        if (should_use_cuvs(config_)) {
-            // copy the IVF centroids to the cuVS index
-            // in case it has been reset. This is because `reset` clears the
-            // cuVS index and its centroids.
-            // TODO: change this once the coarse quantizer is separated from
-            // cuVS index
-            updateQuantizer();
-        };
         return;
     }
 
@@ -243,10 +235,10 @@ void GpuIndexIVFFlat::train(idx_t n, const float* x) {
         cuvs_index_params.n_lists = nlist;
         cuvs_index_params.metric = metricFaissToCuvs(metric_type, false);
         cuvs_index_params.add_data_on_build = false;
-        cuvs_index_params.kmeans_trainset_fraction =
-                static_cast<double>(cp.max_points_per_centroid * nlist) /
-                static_cast<double>(n);
-        cuvs_index_params.kmeans_n_iters = cp.niter;
+        // kmeans_trainset_fraction and kmeans_n_iters intentionally left
+        // at cuVS defaults (0.5 and 20). Faiss's cp.max_points_per_centroid
+        // (256) was designed for CPU k-means and produces severely
+        // underparameterized training at scale through cuVS.
 
         auto cuvsIndex_ =
                 std::static_pointer_cast<CuvsIVFFlat, IVFFlat>(index_);

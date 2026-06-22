@@ -15,21 +15,26 @@
 #include <vector>
 
 #include <faiss/impl/FaissAssert.h>
+#include <faiss/impl/RaBitQUtils.h>
 #include <faiss/impl/RaBitQuantizer.h>
+#include <faiss/impl/ResultHandler.h>
+#include <faiss/impl/expanded_scanners.h>
 
 namespace faiss {
 
+using rabitq_utils::SignBitFactorsWithError;
+
 IndexIVFRaBitQ::IndexIVFRaBitQ(
-        Index* quantizer,
-        const size_t d,
-        const size_t nlist,
+        Index* quantizer_in,
+        const size_t d_in,
+        const size_t nlist_in,
         MetricType metric,
-        bool own_invlists,
+        bool own_invlists_in,
         uint8_t nb_bits_in)
-        : IndexIVF(quantizer, d, nlist, 0, metric, own_invlists),
-          rabitq(d, metric, nb_bits_in) {
+        : IndexIVF(quantizer_in, d_in, nlist_in, 0, metric, own_invlists_in),
+          rabitq(d_in, metric, nb_bits_in) {
     code_size = rabitq.code_size;
-    if (own_invlists) {
+    if (own_invlists_in) {
         invlists->code_size = code_size;
     }
     is_trained = false;
@@ -44,7 +49,7 @@ IndexIVFRaBitQ::IndexIVFRaBitQ() {
 void IndexIVFRaBitQ::train_encoder(
         idx_t n,
         const float* x,
-        const idx_t* assign) {
+        const idx_t* /*assign*/) {
     rabitq.train(n, x);
 }
 
@@ -121,7 +126,7 @@ void IndexIVFRaBitQ::add_core(
         int rank = omp_get_thread_num();
 
         // each thread takes care of a subset of lists
-        for (size_t i = 0; i < n; i++) {
+        for (idx_t i = 0; i < n; i++) {
             int64_t list_no = precomputed_idx[i];
             if (list_no >= 0 && list_no % nt == rank) {
                 int64_t id = xids ? xids[i] : ntotal + i;
@@ -147,7 +152,10 @@ void IndexIVFRaBitQ::add_core(
     ntotal += n;
 }
 
+namespace {
+
 struct RaBitInvertedListScanner : InvertedListScanner {
+    using InvertedListScanner::scan_codes;
     const IndexIVFRaBitQ& ivf_rabitq;
 
     std::vector<float> reconstructed_centroid;
@@ -162,14 +170,14 @@ struct RaBitInvertedListScanner : InvertedListScanner {
 
     explicit RaBitInvertedListScanner(
             const IndexIVFRaBitQ& ivf_rabitq_in,
-            bool store_pairs = false,
-            const IDSelector* sel = nullptr,
+            bool store_pairs_in = false,
+            const IDSelector* sel_in = nullptr,
             uint8_t qb_in = 0,
-            bool centered = false)
-            : InvertedListScanner(store_pairs, sel),
+            bool centered_in = false)
+            : InvertedListScanner(store_pairs_in, sel_in),
               ivf_rabitq{ivf_rabitq_in},
               qb{qb_in},
-              centered(centered) {
+              centered(centered_in) {
         keep_max = is_similarity_metric(ivf_rabitq.metric_type);
         code_size = ivf_rabitq.code_size;
     }
@@ -182,19 +190,29 @@ struct RaBitInvertedListScanner : InvertedListScanner {
     }
 
     /// following codes come from this inverted list
-    void set_list(idx_t list_no, float coarse_dis) override {
-        this->list_no = list_no;
+    void set_list(idx_t list_no_in, float /*coarse_dis*/) override {
+        this->list_no = list_no_in;
 
         reconstructed_centroid.resize(ivf_rabitq.d);
         ivf_rabitq.quantizer->reconstruct(
-                list_no, reconstructed_centroid.data());
+                list_no_in, reconstructed_centroid.data());
 
         internal_try_setup_dc();
     }
 
     /// compute a single query-to-code distance
-    float distance_to_code(const uint8_t* code) const override {
+    float distance_to_code(const uint8_t* code) const final {
         return dc->distance_to_code(code);
+    }
+
+    // redefiniing the scan_codes allows to inline the distance_to_code
+    // (this is unlikely to matter because it contains a virtual function call)
+    size_t scan_codes_1bit(
+            size_t list_size,
+            const uint8_t* codes,
+            const idx_t* ids,
+            ResultHandler& handler) const {
+        return run_scan_codes(*this, list_size, codes, ids, handler);
     }
 
     /// Override scan_codes to implement adaptive filtering for multi-bit codes
@@ -202,15 +220,12 @@ struct RaBitInvertedListScanner : InvertedListScanner {
             size_t list_size,
             const uint8_t* codes,
             const idx_t* ids,
-            float* simi,
-            idx_t* idxi,
-            size_t k) const override {
+            ResultHandler& handler) const override {
         size_t ex_bits = ivf_rabitq.rabitq.nb_bits - 1;
 
         // For 1-bit codes, use default implementation
         if (ex_bits == 0 || rabitq_dc == nullptr) {
-            return InvertedListScanner::scan_codes(
-                    list_size, codes, ids, simi, idxi, k);
+            return scan_codes_1bit(list_size, codes, ids, handler);
         }
 
         // Multi-bit: Two-stage search with adaptive filtering
@@ -225,37 +240,35 @@ struct RaBitInvertedListScanner : InvertedListScanner {
                 }
             }
 
-            // Stage 1: Compute lower bound using 1-bit codes
-            float lower_bound = rabitq_dc->lower_bound_distance(codes);
+            float est_distance = rabitq_dc->distance_to_code_1bit(codes);
 
-            // Stage 2: Adaptive filtering
-            // L2 (min-heap): filter if lower_bound < simi[0]
-            // IP (max-heap): filter if lower_bound > simi[0]
-            // Note: Using simi[0] directly (not cached) enables more aggressive
-            // filtering as the heap is updated with better candidates
-            bool is_promising = keep_max ? (lower_bound > simi[0])
-                                         : (lower_bound < simi[0]);
+            size_t code_size_base = (ivf_rabitq.d + 7) / 8;
+            const rabitq_utils::SignBitFactorsWithError* base_fac =
+                    reinterpret_cast<
+                            const rabitq_utils::SignBitFactorsWithError*>(
+                            codes + code_size_base);
 
-            if (is_promising) {
-                // Lower bound is promising, compute full distance
+            bool should_refine = rabitq_utils::should_refine_candidate(
+                    est_distance,
+                    base_fac->f_error,
+                    rabitq_dc->g_error,
+                    handler.threshold,
+                    keep_max);
+            if (should_refine) {
+                // Refining computes the full distance — counts as a
+                // post-filter "distance computed" for stats purposes.
+                handler.stats.scan_cnt++;
                 float dis = distance_to_code(codes);
+                int64_t id = store_pairs ? lo_build(list_no, j) : ids[j];
 
-                // Check if distance improves heap
-                bool improves_heap =
-                        keep_max ? (dis > simi[0]) : (dis < simi[0]);
-
-                if (improves_heap) {
-                    int64_t id = store_pairs ? lo_build(list_no, j) : ids[j];
-                    if (keep_max) {
-                        minheap_replace_top(k, simi, idxi, dis, id);
-                    } else {
-                        maxheap_replace_top(k, simi, idxi, dis, id);
-                    }
+                if (handler.add_result(dis, id)) {
+                    handler.stats.nheap_updates++;
                     nup++;
                 }
             }
             codes += code_size;
         }
+
         return nup;
     }
 
@@ -273,6 +286,8 @@ struct RaBitInvertedListScanner : InvertedListScanner {
         }
     }
 };
+
+} // namespace
 
 InvertedListScanner* IndexIVFRaBitQ::get_InvertedListScanner(
         bool store_pairs,
@@ -294,12 +309,12 @@ void IndexIVFRaBitQ::reconstruct_from_offset(
         int64_t list_no,
         int64_t offset,
         float* recons) const {
-    const uint8_t* code = invlists->get_single_code(list_no, offset);
+    InvertedLists::ScopedCodes sc(invlists, list_no, offset);
 
     std::vector<float> centroid(d);
     quantizer->reconstruct(list_no, centroid.data());
 
-    rabitq.decode_core(code, recons, 1, centroid.data());
+    rabitq.decode_core(sc.get(), recons, 1, centroid.data());
 }
 
 void IndexIVFRaBitQ::sa_decode(idx_t n, const uint8_t* codes, float* x) const {
@@ -342,29 +357,20 @@ float IVFRaBitDistanceComputer::operator()(idx_t i) {
     uint64_t list_no = lo_listno(lo);
     uint64_t offset = lo_offset(lo);
 
-    const uint8_t* code = parent->invlists->get_single_code(list_no, offset);
+    InvertedLists::ScopedCodes sc(parent->invlists, list_no, offset);
 
     // ok, we know the appropriate cluster that we need
     std::vector<float> centroid(parent->d);
     parent->quantizer->reconstruct(list_no, centroid.data());
 
-    // compute the distance
-    float distance = 0;
-
     std::unique_ptr<FlatCodesDistanceComputer> dc(
             parent->rabitq.get_distance_computer(
                     parent->qb, centroid.data(), /*centered=*/false));
     dc->set_query(q);
-    distance = dc->distance_to_code(code);
-
-    // deallocate
-    parent->invlists->release_codes(list_no, code);
-
-    // done
-    return distance;
+    return dc->distance_to_code(sc.get());
 }
 
-float IVFRaBitDistanceComputer::symmetric_dis(idx_t i, idx_t j) {
+float IVFRaBitDistanceComputer::symmetric_dis(idx_t /*i*/, idx_t /*j*/) {
     FAISS_THROW_MSG("Not implemented");
 }
 

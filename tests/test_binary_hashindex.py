@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 import faiss
 
-from common_faiss_tests import make_binary_dataset
+from common_faiss_tests import for_all_simd_levels, make_binary_dataset
 
 
 def bitvec_shuffle(a, order):
@@ -42,6 +42,7 @@ class TestSmallFuncs(unittest.TestCase):
         np.testing.assert_array_equal(x, z)
 
 
+@for_all_simd_levels
 class TestRange(unittest.TestCase):
 
     def test_hash(self):
@@ -122,6 +123,7 @@ class TestRange(unittest.TestCase):
         self.assertTrue(np.all(nfound[1:] >= nfound[:-1]))
 
 
+@for_all_simd_levels
 class TestKnn(unittest.TestCase):
 
     def test_hash_and_multihash(self):
@@ -165,6 +167,13 @@ class TestKnn(unittest.TestCase):
             D2, I2 = index2.search(xq, k)
             np.testing.assert_array_equal(Inew, I2)
             np.testing.assert_array_equal(Dnew, D2)
+
+            # Verify deserialized index is serializable again
+            index3 = faiss.deserialize_index_binary(
+                faiss.serialize_index_binary(index2))
+            D3, I3 = index3.search(xq, k)
+            np.testing.assert_array_equal(Inew, I3)
+            np.testing.assert_array_equal(Dnew, D3)
 
         self.assertGreater(3, abs(nfound[(0, 7)] - nfound[(1, 7)]))
         self.assertGreater(nfound[(3, 7)], nfound[(1, 7)])

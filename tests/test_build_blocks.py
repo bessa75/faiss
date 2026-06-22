@@ -10,7 +10,7 @@ import numpy as np
 import faiss
 import unittest
 
-from common_faiss_tests import get_dataset_2
+from common_faiss_tests import get_dataset_2, for_all_simd_levels
 
 
 class TestPCA(unittest.TestCase):
@@ -32,6 +32,30 @@ class TestPCA(unittest.TestCase):
         for o in column_norm2:
             self.assertGreater(prev, o)
             prev = o
+
+    def test_pca_retraining_gram_path(self):
+        # Regression test for the sgemm_ beta=0 fix in PCAMatrix::train.
+        # When n < d_in, train() takes the Gram-matrix code path and
+        # writes PCAMat via sgemm_. Before the fix, beta=1.0 caused the
+        # second train() call to accumulate stale values from the first
+        # call, corrupting the PCA basis. Calling train() twice with the
+        # same data must produce the same projection.
+        d = 64
+        n = 20  # n < d_in exercises the Gram-matrix branch
+        np.random.seed(123)
+        x = np.random.random(size=(n, d)).astype('float32')
+
+        pca = faiss.PCAMatrix(d, 8)
+        pca.train(x)
+        y_first = pca.apply_py(x)
+
+        pca.train(x)
+        y_second = pca.apply_py(x)
+
+        # Eigenvectors are unique up to per-component sign; compare abs.
+        np.testing.assert_allclose(
+            np.abs(y_first), np.abs(y_second), atol=1e-4
+        )
 
     def test_pca_epsilon(self):
         d = 64
@@ -78,6 +102,82 @@ class TestMapLong2Long(unittest.TestCase):
         assert np.all(m.search_multiple(keys) == vals)
 
         assert m.search(12343) == -1
+
+
+class TestHadamardRotation(unittest.TestCase):
+
+    def test_shape(self):
+        d = 128
+        n = 100
+        np.random.seed(123)
+        x = np.random.randn(n, d).astype('float32')
+
+        fr = faiss.HadamardRotation(d)
+        y = fr.apply(x)
+        # d=128 is a power of 2, so d_out == d_in
+        self.assertEqual(y.shape, (n, d))
+
+    def test_non_power_of_2(self):
+        """Non-power-of-2 dimensions are zero-padded to next power of 2."""
+        cases = {192: 256, 384: 512, 768: 1024, 1536: 2048}
+        for d, expected_out in cases.items():
+            np.random.seed(42)
+            x = np.random.randn(20, d).astype('float32')
+            fr = faiss.HadamardRotation(d)
+            self.assertEqual(fr.d_out, expected_out)
+            y = fr.apply(x)
+            self.assertEqual(y.shape, (20, expected_out))
+            # output should be finite and non-trivial
+            self.assertTrue(np.all(np.isfinite(y)))
+            self.assertFalse(np.allclose(y, 0))
+
+    def test_deterministic(self):
+        d = 64
+        n = 20
+        np.random.seed(789)
+        x = np.random.randn(n, d).astype('float32')
+
+        fr1 = faiss.HadamardRotation(d, 42)
+        fr2 = faiss.HadamardRotation(d, 42)
+        y1 = fr1.apply(x)
+        y2 = fr2.apply(x)
+        np.testing.assert_array_equal(y1, y2)
+
+    def test_different_seeds(self):
+        d = 64
+        n = 20
+        np.random.seed(101)
+        x = np.random.randn(n, d).astype('float32')
+
+        fr1 = faiss.HadamardRotation(d, 1)
+        fr2 = faiss.HadamardRotation(d, 2)
+        y1 = fr1.apply(x)
+        y2 = fr2.apply(x)
+        self.assertFalse(np.allclose(y1, y2))
+
+    def test_norm_preservation_power_of_2(self):
+        """Hadamard transform preserves L2 norms for power-of-2 dims."""
+        d = 256
+        np.random.seed(42)
+        x = np.random.randn(100, d).astype('float32')
+        fr = faiss.HadamardRotation(d)
+        y = fr.apply(x)
+        norms_in = np.linalg.norm(x, axis=1)
+        norms_out = np.linalg.norm(y, axis=1)
+        np.testing.assert_allclose(norms_in, norms_out, rtol=1e-4)
+
+    def test_index_factory(self):
+        d = 64
+        n = 500
+        np.random.seed(202)
+        x = np.random.randn(n, d).astype('float32')
+
+        index = faiss.index_factory(d, "HR,Flat")
+        index.train(x)
+        index.add(x)
+        D, I = index.search(x[:5], 5)
+        # first result for each query should be itself
+        np.testing.assert_array_equal(I[:, 0], np.arange(5))
 
 
 class TestOrthogonalReconstruct(unittest.TestCase):
@@ -221,6 +321,7 @@ class TestMatrixStats(unittest.TestCase):
         self.assertTrue(cc[0] == cc[1])
 
 
+@for_all_simd_levels
 class TestScalarQuantizer(unittest.TestCase):
 
     def test_8bit_equiv(self):
@@ -343,6 +444,7 @@ class TestRandom(unittest.TestCase):
         self.assertLess(ninter, 460)
 
 
+@for_all_simd_levels
 class TestPairwiseDis(unittest.TestCase):
 
     def test_L2(self):
